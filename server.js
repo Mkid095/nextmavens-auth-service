@@ -1,6 +1,6 @@
 const express = require('express');
 const WebSocket = require('ws');
-const { createClient } = require('pg-listen');
+const { Client } = require('pg');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
@@ -11,18 +11,21 @@ app.use(express.json());
 // Configuration
 const PORT = process.env.PORT || 4003;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-jwt-secret';
-const PG_CONNECTION = {
-  connectionString: process.env.DATABASE_URL || 'postgresql://nextmavens:Elishiba@95@nextmavens-db-m4sxnf.1.mvuvh68efk7jnvynmv8r2jm2u:5432/nextmavens'
-};
+
+// Parse DATABASE_URL
+const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://nextmavens:Elishiba@95@nextmavens-db-m4sxnf.1.mvuvh68efk7jnvynmv8r2jm2u:5432/nextmavens';
 
 // Store for active connections
 const connections = new Map(); // connectionId -> { ws, userId, tenantId, subscriptions }
 const channelSubscriptions = new Map(); // channelName -> Set of connectionIds
 
-// PostgreSQL NOTIFY/LISTEN client
-const pgClient = createClient(PG_CONNECTION);
+// Presence system
+const presenceState = new Map(); // channel -> Map of userId -> presence data
 
-// JWT verification middleware
+// PostgreSQL client for LISTEN/NOTIFY
+const pgClient = new Client({ connectionString: DATABASE_URL });
+
+// JWT verification
 const verifyToken = (token) => {
   try {
     return jwt.verify(token, JWT_SECRET);
@@ -31,44 +34,7 @@ const verifyToken = (token) => {
   }
 };
 
-// PostgreSQL notification handler
-const handlePostgresNotification = async (payload) => {
-  try {
-    const { channel, payload: data } = payload;
-    const notification = JSON.parse(data);
-
-    console.log(`[PostgreSQL] Channel: ${channel}, Payload:`, notification);
-
-    // Find all connections subscribed to this channel
-    const subscribers = channelSubscriptions.get(channel);
-    if (subscribers) {
-      const message = JSON.stringify({
-        type: 'postgres_change',
-        payload: {
-          data: notification.data,
-          event: notification.event || 'INSERT',
-          schema: notification.schema || 'public',
-          table: notification.table,
-          timestamp: new Date().toISOString()
-        }
-      });
-
-      subscribers.forEach(connId => {
-        const connection = connections.get(connId);
-        if (connection && connection.ws.readyState === WebSocket.OPEN) {
-          // Check tenant isolation
-          if (!notification.tenantId || connection.tenantId === notification.tenantId) {
-            connection.ws.send(message);
-          }
-        }
-      });
-    }
-  } catch (error) {
-    console.error('[PostgreSQL] Notification error:', error);
-  }
-};
-
-// Broadcast to all connections in a tenant
+// Broadcast to tenant
 const broadcastToTenant = (tenantId, message, excludeConnectionId = null) => {
   connections.forEach((connection, connId) => {
     if (connection.tenantId === tenantId && connId !== excludeConnectionId) {
@@ -79,7 +45,7 @@ const broadcastToTenant = (tenantId, message, excludeConnectionId = null) => {
   });
 };
 
-// Broadcast to all connections subscribed to a channel
+// Broadcast to channel
 const broadcastToChannel = (channel, message) => {
   const subscribers = channelSubscriptions.get(channel);
   if (subscribers) {
@@ -92,9 +58,7 @@ const broadcastToChannel = (channel, message) => {
   }
 };
 
-// Presence system
-const presenceState = new Map(); // channel -> Map of userId -> presence data
-
+// Presence functions
 const updatePresence = (channel, userId, tenantId, data) => {
   if (!presenceState.has(channel)) {
     presenceState.set(channel, new Map());
@@ -113,7 +77,6 @@ const updatePresence = (channel, userId, tenantId, data) => {
 
   channelState.set(userId, presenceData);
 
-  // Broadcast presence update to channel subscribers
   broadcastToChannel(channel, {
     type: 'presence',
     event: 'sync',
@@ -140,7 +103,6 @@ const removePresence = (userId) => {
   });
 };
 
-// Get presence state for a channel
 const getPresenceState = (channel) => {
   const state = presenceState.get(channel);
   if (!state) return {};
@@ -158,15 +120,43 @@ const initializePostgresListener = async () => {
     await pgClient.connect();
     console.log('[PostgreSQL] Connected for LISTEN/NOTIFY');
 
-    pgClient.notifications.on('error', (error) => {
-      console.error('[PostgreSQL] Notification error:', error);
-    });
+    pgClient.on('notification', (msg) => {
+      try {
+        const { channel, payload } = msg;
+        console.log(`[PostgreSQL] Channel: ${channel}, Payload: ${payload}`);
 
-    pgClient.notifications.on(handlePostgresNotification);
+        let notification;
+        try {
+          notification = JSON.parse(payload);
+        } catch {
+          notification = { raw: payload };
+        }
 
-    // Listen to all channels dynamically
-    pgClient.on('connected', () => {
-      console.log('[PostgreSQL] Listener connected');
+        const subscribers = channelSubscriptions.get(channel);
+        if (subscribers) {
+          const message = JSON.stringify({
+            type: 'postgres_change',
+            payload: {
+              data: notification.data || notification,
+              event: notification.event || 'INSERT',
+              schema: notification.schema || 'public',
+              table: notification.table || channel,
+              timestamp: new Date().toISOString()
+            }
+          });
+
+          subscribers.forEach(connId => {
+            const connection = connections.get(connId);
+            if (connection && connection.ws.readyState === WebSocket.OPEN) {
+              if (!notification.tenantId || connection.tenantId === notification.tenantId) {
+                connection.ws.send(message);
+              }
+            }
+          });
+        }
+      } catch (error) {
+        console.error('[PostgreSQL] Notification error:', error);
+      }
     });
 
     pgClient.on('error', (error) => {
@@ -178,17 +168,35 @@ const initializePostgresListener = async () => {
   }
 };
 
+// Subscribe to PostgreSQL channel
+const subscribeToChannel = async (channel) => {
+  try {
+    await pgClient.query(`LISTEN ${channel}`);
+    console.log(`[PostgreSQL] Subscribed to channel: ${channel}`);
+  } catch (error) {
+    console.error(`[PostgreSQL] Failed to subscribe to ${channel}:`, error);
+  }
+};
+
+// Unsubscribe from PostgreSQL channel
+const unsubscribeFromChannel = async (channel) => {
+  try {
+    await pgClient.query(`UNLISTEN ${channel}`);
+    console.log(`[PostgreSQL] Unsubscribed from channel: ${channel}`);
+  } catch (error) {
+    console.error(`[PostgreSQL] Failed to unsubscribe from ${channel}:`, error);
+  }
+};
+
 // WebSocket server
 const wss = new WebSocket.Server({ noServer: true });
 
-// Handle WebSocket upgrade
 wss.on('connection', (ws, req, tokenData) => {
   const connectionId = uuidv4();
   const { userId, tenantId, role } = tokenData;
 
   console.log(`[WebSocket] Connection ${connectionId} - User: ${userId}, Tenant: ${tenantId}`);
 
-  // Initialize connection
   connections.set(connectionId, {
     ws,
     userId,
@@ -197,7 +205,6 @@ wss.on('connection', (ws, req, tokenData) => {
     subscriptions: new Set()
   });
 
-  // Send welcome message
   ws.send(JSON.stringify({
     event: 'system',
     type: 'connected',
@@ -205,7 +212,6 @@ wss.on('connection', (ws, req, tokenData) => {
     timestamp: new Date().toISOString()
   }));
 
-  // Handle incoming messages
   ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data);
@@ -218,25 +224,15 @@ wss.on('connection', (ws, req, tokenData) => {
 
       switch (message.type) {
         case 'subscribe':
-          // Subscribe to PostgreSQL channel
           const channel = message.channel;
           if (channel) {
-            // Add to channel subscriptions
             if (!channelSubscriptions.has(channel)) {
               channelSubscriptions.set(channel, new Set());
-
-              // Subscribe to PostgreSQL notifications for this channel
-              await pgClient.notify(channel, JSON.stringify({
-                event: 'subscribe',
-                data: { connectionId, userId }
-              }));
+              subscribeToChannel(channel);
             }
 
             channelSubscriptions.get(channel).add(connectionId);
             connection.subscriptions.add(channel);
-
-            // Also listen in PostgreSQL
-            await pgClient.listen(channel);
 
             ws.send(JSON.stringify({
               event: 'subscribed',
@@ -258,7 +254,7 @@ wss.on('connection', (ws, req, tokenData) => {
               subs.delete(connectionId);
               if (subs.size === 0) {
                 channelSubscriptions.delete(unsubChannel);
-                await pgClient.unlisten(unsubChannel);
+                unsubscribeFromChannel(unsubChannel);
               }
             }
 
@@ -273,7 +269,6 @@ wss.on('connection', (ws, req, tokenData) => {
           break;
 
         case 'broadcast':
-          // Broadcast to other connections in the same tenant
           const broadcastMsg = message.payload;
           if (broadcastMsg) {
             broadcastToTenant(tenantId, {
@@ -291,7 +286,6 @@ wss.on('connection', (ws, req, tokenData) => {
           break;
 
         case 'presence':
-          // Handle presence updates
           const presenceChannel = message.channel || 'presence';
           const presenceData = message.payload;
 
@@ -300,7 +294,6 @@ wss.on('connection', (ws, req, tokenData) => {
             online: true
           });
 
-          // Send current presence state to user
           ws.send(JSON.stringify({
             type: 'presence',
             event: 'state',
@@ -328,11 +321,9 @@ wss.on('connection', (ws, req, tokenData) => {
     }
   });
 
-  // Handle connection close
   ws.on('close', () => {
     console.log(`[WebSocket] Connection ${connectionId} closed`);
 
-    // Remove from all channel subscriptions
     const connection = connections.get(connectionId);
     if (connection) {
       connection.subscriptions.forEach(channel => {
@@ -341,18 +332,17 @@ wss.on('connection', (ws, req, tokenData) => {
           subs.delete(connectionId);
           if (subs.size === 0) {
             channelSubscriptions.delete(channel);
+            unsubscribeFromChannel(channel);
           }
         }
       });
 
-      // Remove presence
       removePresence(userId);
     }
 
     connections.delete(connectionId);
   });
 
-  // Handle errors
   ws.on('error', (error) => {
     console.error(`[WebSocket] Connection ${connectionId} error:`, error);
   });
@@ -365,7 +355,8 @@ const server = app.listen(PORT, () => {
 
 // Handle WebSocket upgrade
 server.on('upgrade', (req, socket, head) => {
-  const token = new URL(req.url, `http://${req.headers.host}`).searchParams.get('token');
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const token = url.searchParams.get('token');
 
   if (!token) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -396,7 +387,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Helper endpoint to trigger PostgreSQL notifications
+// Send notification endpoint
 app.post('/api/notify', async (req, res) => {
   try {
     const { channel, data, tenantId } = req.body;
@@ -405,11 +396,14 @@ app.post('/api/notify', async (req, res) => {
       return res.status(400).json({ error: 'Channel is required' });
     }
 
-    await pgClient.notify(channel, JSON.stringify({
-      event: 'insert',
-      data,
-      tenantId
-    }));
+    await pgClient.query(`SELECT pg_notify($1, $2)`, [
+      channel,
+      JSON.stringify({
+        event: 'insert',
+        data,
+        tenantId
+      })
+    ]);
 
     res.json({ success: true, channel });
   } catch (error) {
@@ -443,15 +437,12 @@ initializePostgresListener().catch(console.error);
 process.on('SIGTERM', async () => {
   console.log('[System] SIGTERM received, shutting down...');
 
-  // Close all WebSocket connections
   connections.forEach((connection) => {
     connection.ws.close();
   });
 
-  // Close PostgreSQL client
-  await pgClient.close();
+  await pgClient.end();
 
-  // Close server
   server.close(() => {
     console.log('[System] Server closed');
     process.exit(0);
